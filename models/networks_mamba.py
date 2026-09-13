@@ -140,7 +140,12 @@ class SelectiveScan2D(nn.Module):
                 mask = torch.tril(torch.ones(c, c, device=u.device, dtype=u.dtype))
                 decay_ik = decay_ik * mask.view(1, c, c, 1, 1)          # chi giu k<=i
 
-                h_intra = torch.einsum('bikds,bkds->bids', decay_ik, v)  # dong gop noi bo chunk
+                # [PATCH buoc 7] gop (D,S) vao truc batch de dung bmm() (GEMM toi uu)
+                # thay vi einsum 5D (thuong cham hon nhieu tren GPU).
+                _Bc, _c1, _c2, _Dc, _Sc = decay_ik.shape
+                _decay_bmm = decay_ik.permute(0, 3, 4, 1, 2).reshape(_Bc * _Dc * _Sc, _c1, _c2)
+                _v_bmm = v.permute(0, 2, 3, 1).reshape(_Bc * _Dc * _Sc, _c2, 1)
+                h_intra = torch.bmm(_decay_bmm, _v_bmm).reshape(_Bc, _Dc, _Sc, _c1).permute(0, 3, 1, 2)  # dong gop noi bo chunk
                 h_chunk = h_from_H + h_intra                              # (B,c,D,S) = h tai tung buoc
 
                 y_chunk = (h_chunk * Cs_c.unsqueeze(2)).sum(-1)           # (B,c,D)
