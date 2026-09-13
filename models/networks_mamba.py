@@ -117,9 +117,11 @@ class SelectiveScan2D(nn.Module):
             def _process_chunk(dt_c, Bs_c, Cs_c, u_c, H_in):
                 # dt_c,u_c: (B,c,D) ; Bs_c,Cs_c: (B,c,S) ; H_in: (B,D,S)
                 c = dt_c.shape[1]
-                dA_c = torch.exp(dt_c.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))     # (B,c,D,S)
-                logA_c = torch.log(dA_c)                          # an toan: dA>0 luon dung
-                cumlog = torch.cumsum(logA_c, dim=1)               # (B,c,D,S)
+                # [FIX buoc 6] logA_c = log(dA_c) = log(exp(dt*A)) = dt*A THANG,
+                # khong di vong qua exp() roi log() lai (di vong bi underflow
+                # ve log(0)=-inf khi dt*A rat am).
+                logA_c = dt_c.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)   # (B,c,D,S) = log(dA_c)
+                cumlog = torch.cumsum(logA_c, dim=1)               # (B,c,D,S), <= 0 luon dung
 
                 h_from_H = torch.exp(cumlog) * H_in.unsqueeze(1)   # dong gop tu carry chunk truoc
 
@@ -128,7 +130,13 @@ class SelectiveScan2D(nn.Module):
 
                 cumlog_i = cumlog.unsqueeze(2)                        # (B,c,1,D,S)
                 cumlog_k = cumlog.unsqueeze(1)                        # (B,1,c,D,S)
-                decay_ik = torch.exp(cumlog_i - cumlog_k)              # (B,c,c,D,S), luon <=1 (an toan)
+                # [FIX buoc 6] clamp <=0 TRUOC exp: cac cap se bi mask (k>i) co
+                # hieu duong/lon, exp truc tiep se TRAN SO (+inf) roi inf*0=NaN
+                # khi nhan voi mask ben duoi. Clamp truoc dam bao decay_ik luon
+                # huu han trong [0,1], mask sau do van loai dung cac cap khong
+                # hop le (gia tri clamp cua chung khong quan trong vi se bi *0).
+                diff = torch.clamp(cumlog_i - cumlog_k, max=0.0)
+                decay_ik = torch.exp(diff)                              # (B,c,c,D,S), luon trong [0,1]
                 mask = torch.tril(torch.ones(c, c, device=u.device, dtype=u.dtype))
                 decay_ik = decay_ik * mask.view(1, c, c, 1, 1)          # chi giu k<=i
 
