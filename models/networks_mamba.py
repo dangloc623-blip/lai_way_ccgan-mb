@@ -103,7 +103,7 @@ class SelectiveScan2D(nn.Module):
             u = u.float()
             B, L, D = u.shape
             d_state = self.d_state
-            _SCAN_CHUNK = 64
+            _SCAN_CHUNK = 128  # tang tu 64 (buoc 8) -- bo nho dang du nhieu, giam 1 nua so lan goi checkpoint()
             Csz = min(_SCAN_CHUNK, L)
 
             x_dbc = self.x_proj(u)                          # (B, L, d_state*2+1)
@@ -160,9 +160,10 @@ class SelectiveScan2D(nn.Module):
                 dt_c, Bs_c, Cs_c, u_c = dt[:, start:end], B_ssm[:, start:end], C_ssm[:, start:end], u[:, start:end]
                 if use_ckpt:
                     # checkpoint TUNG CHUNK (khong phai ca ham) -- de luc backward chi 1
-                    # chunk giu do thi O(C^2) cung luc, tranh OOM.
+                    # chunk giu do thi O(C^2) cung luc, tranh OOM. preserve_rng_state=False
+                    # vi model KHONG CO Dropout -- bo qua dong bo GPU thua de luu RNG.
                     H, y_chunk = _grad_checkpoint(_process_chunk, dt_c, Bs_c, Cs_c, u_c, H,
-                                                   use_reentrant=False)
+                                                   use_reentrant=False, preserve_rng_state=False)
                 else:
                     H, y_chunk = _process_chunk(dt_c, Bs_c, Cs_c, u_c, H)
                 outs.append(y_chunk)
