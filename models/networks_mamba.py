@@ -24,12 +24,19 @@ from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from .networks import get_norm_layer, init_net
 
+try:
+    from mamba_ssm import Mamba as _OfficialMamba
+    _HAS_MAMBA_SSM = True
+except Exception as _mamba_ssm_import_err:
+    _HAS_MAMBA_SSM = False
+    _MAMBA_SSM_IMPORT_ERR = repr(_mamba_ssm_import_err)
+
 
 # =============================================================================
 # 1. Selective Scan — pure PyTorch, 2-direction cross-scan
 # =============================================================================
 
-class SelectiveScan2D(nn.Module):
+class _SelectiveScan2D_PurePython(nn.Module):
     """
     Simplified Selective Scan (S6) for 2-D images.
     Scans in 2 directions:
@@ -196,12 +203,7 @@ class SelectiveScan2D(nn.Module):
                 seq = seq.flip(1)
             # Checkpoint gio nam BEN TRONG _ssm_scan (theo tung chunk), khong con
             # checkpoint ca ham o day nua (xem [PATCH v2] trong _ssm_scan).
-            if self.training and seq.requires_grad:
-                # gradient checkpointing: khong luu activation trung gian cua
-                # vong lap 4096 buoc, tinh lai luc backward -> giam manh VRAM
-                y = _grad_checkpoint(self._ssm_scan, seq, use_reentrant=False)
-            else:
-                y = self._ssm_scan(seq)    # (B, L, d_inner)
+            y = self._ssm_scan(seq)    # (B, L, d_inner)
             if d == 1:
                 y = y.flip(1)
             outs.append(y)
@@ -218,6 +220,50 @@ class SelectiveScan2D(nn.Module):
         # Reshape back to spatial
         y = y.reshape(B, H, W, C).permute(0, 3, 1, 2)         # (B, C, H, W)
         return y + identity                                     # residual
+
+
+class _SelectiveScan2D_Official(nn.Module):
+    """
+    2-direction selective scan dung CUDA kernel CHINH THUC cua mamba_ssm
+    (selective_scan_fn) -- nhanh hon ban thuan PyTorch rat nhieu vi khong
+    can Python loop/chunking/gradient-checkpoint nua, CUDA kernel tu lam
+    het o tang phan cung.
+    """
+
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 3,
+                 expand: float = 2.0):
+        super().__init__()
+        self.mamba_fwd = _OfficialMamba(d_model=d_model, d_state=d_state,
+                                         d_conv=d_conv, expand=expand)
+        self.mamba_bwd = _OfficialMamba(d_model=d_model, d_state=d_state,
+                                         d_conv=d_conv, expand=expand)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x : (B, C, H, W)"""
+        B, C, H, W = x.shape
+        identity = x
+        x_flat = x.permute(0, 2, 3, 1).reshape(B, H * W, C)   # (B, L, C)
+
+        y_fwd = self.mamba_fwd(x_flat)
+        y_bwd = self.mamba_bwd(x_flat.flip(1)).flip(1)
+        y = (y_fwd + y_bwd) * 0.5                              # trung binh 2 huong quet
+
+        y = self.norm(y)
+        y = y.reshape(B, H, W, C).permute(0, 3, 1, 2)          # (B, C, H, W)
+        return y + identity                                      # residual
+
+
+# Chon implementation: dung CUDA kernel chinh thuc neu import mamba_ssm
+# thanh cong, neu khong TU DONG roi ve ban thuan PyTorch (da verify o buoc
+# 1-8) -- khong crash trong ca 2 truong hop.
+if _HAS_MAMBA_SSM:
+    SelectiveScan2D = _SelectiveScan2D_Official
+    print('[networks_mamba] Dung mamba_ssm CUDA kernel CHINH THUC (nhanh).')
+else:
+    SelectiveScan2D = _SelectiveScan2D_PurePython
+    print(f'[networks_mamba] KHONG import duoc mamba_ssm ({_MAMBA_SSM_IMPORT_ERR}) -- '
+          f'dung ban thuan PyTorch (cham hon nhieu, xem huong dan cai mamba-ssm o Muc 2b).')
 
 
 # =============================================================================
