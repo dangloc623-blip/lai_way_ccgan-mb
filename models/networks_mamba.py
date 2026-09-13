@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from .networks import get_norm_layer, init_net
 
@@ -94,39 +95,68 @@ class SelectiveScan2D(nn.Module):
         u : (B, L, d_inner)
         returns y : (B, L, d_inner)
         """
-        B, L, D = u.shape
-        d_state = self.d_state
+        # [PATCH v2] CHUNKED PARALLEL SCAN (thay vong lap tung-buoc-mot bang
+        # vong lap qua CHUNK, moi chunk tinh song song noi bo). Cong thuc toan
+        # hoc CHINH XAC giong ban tuan tu (da kiem chung bang so hoc rieng).
+        orig_dtype = u.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            u = u.float()
+            B, L, D = u.shape
+            d_state = self.d_state
+            _SCAN_CHUNK = 64
+            Csz = min(_SCAN_CHUNK, L)
 
-        # Project u → (dt_raw, B_ssm, C_ssm)
-        x_dbc = self.x_proj(u)                          # (B, L, d_state*2+1)
-        dt_raw = x_dbc[..., :1]                          # (B, L, 1)
-        B_ssm = x_dbc[..., 1:d_state + 1]               # (B, L, d_state)
-        C_ssm = x_dbc[..., d_state + 1:]                # (B, L, d_state)
+            x_dbc = self.x_proj(u)                          # (B, L, d_state*2+1)
+            dt_raw = x_dbc[..., :1]                          # (B, L, 1)
+            B_ssm = x_dbc[..., 1:d_state + 1]               # (B, L, d_state)
+            C_ssm = x_dbc[..., d_state + 1:]                # (B, L, d_state)
 
-        # Softplus dt
-        dt = F.softplus(self.dt_proj(dt_raw))            # (B, L, d_inner)
+            dt = F.softplus(self.dt_proj(dt_raw))            # (B, L, d_inner)
+            A = -torch.exp(self.A_log)                       # (d_inner, d_state)
 
-        # Discretise A:  A_bar = exp(-exp(A_log) * dt)
-        A = -torch.exp(self.A_log)                       # (d_inner, d_state)
-        # dt: (B,L,D), A: (D,S) → dA: (B,L,D,S)
-        dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
+            def _process_chunk(dt_c, Bs_c, Cs_c, u_c, H_in):
+                # dt_c,u_c: (B,c,D) ; Bs_c,Cs_c: (B,c,S) ; H_in: (B,D,S)
+                c = dt_c.shape[1]
+                dA_c = torch.exp(dt_c.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))     # (B,c,D,S)
+                logA_c = torch.log(dA_c)                          # an toan: dA>0 luon dung
+                cumlog = torch.cumsum(logA_c, dim=1)               # (B,c,D,S)
 
-        # dB: (B,L,D,S)  =  dt * B_ssm
-        dB = dt.unsqueeze(-1) * B_ssm.unsqueeze(2)
+                h_from_H = torch.exp(cumlog) * H_in.unsqueeze(1)   # dong gop tu carry chunk truoc
 
-        # Recurrence: h is (B, D, S)
-        h = torch.zeros(B, D, d_state, device=u.device, dtype=u.dtype)
-        ys = []
-        for t in range(L):
-            # h_t = A_bar * h_{t-1} + dB * u_t
-            h = dA[:, t] * h + dB[:, t] * u[:, t].unsqueeze(-1)  # (B,D,S)
-            # y_t = C * h_t
-            y_t = (h * C_ssm[:, t].unsqueeze(1)).sum(-1)          # (B,D)
-            ys.append(y_t)
+                dB_c = dt_c.unsqueeze(-1) * Bs_c.unsqueeze(2)       # (B,c,D,S)
+                v = dB_c * u_c.unsqueeze(-1)                          # (B,c,D,S)
 
-        y = torch.stack(ys, dim=1)                       # (B, L, D)
-        y = y + u * self.D.unsqueeze(0).unsqueeze(0)     # skip connection
-        return y
+                cumlog_i = cumlog.unsqueeze(2)                        # (B,c,1,D,S)
+                cumlog_k = cumlog.unsqueeze(1)                        # (B,1,c,D,S)
+                decay_ik = torch.exp(cumlog_i - cumlog_k)              # (B,c,c,D,S), luon <=1 (an toan)
+                mask = torch.tril(torch.ones(c, c, device=u.device, dtype=u.dtype))
+                decay_ik = decay_ik * mask.view(1, c, c, 1, 1)          # chi giu k<=i
+
+                h_intra = torch.einsum('bikds,bkds->bids', decay_ik, v)  # dong gop noi bo chunk
+                h_chunk = h_from_H + h_intra                              # (B,c,D,S) = h tai tung buoc
+
+                y_chunk = (h_chunk * Cs_c.unsqueeze(2)).sum(-1)           # (B,c,D)
+                H_out = h_chunk[:, -1]                                      # carry cho chunk sau
+                return H_out, y_chunk
+
+            H = torch.zeros(B, D, d_state, device=u.device, dtype=u.dtype)
+            outs = []
+            use_ckpt = self.training and u.requires_grad
+            for start in range(0, L, Csz):
+                end = min(start + Csz, L)
+                dt_c, Bs_c, Cs_c, u_c = dt[:, start:end], B_ssm[:, start:end], C_ssm[:, start:end], u[:, start:end]
+                if use_ckpt:
+                    # checkpoint TUNG CHUNK (khong phai ca ham) -- de luc backward chi 1
+                    # chunk giu do thi O(C^2) cung luc, tranh OOM.
+                    H, y_chunk = _grad_checkpoint(_process_chunk, dt_c, Bs_c, Cs_c, u_c, H,
+                                                   use_reentrant=False)
+                else:
+                    H, y_chunk = _process_chunk(dt_c, Bs_c, Cs_c, u_c, H)
+                outs.append(y_chunk)
+
+            y = torch.cat(outs, dim=1)                        # (B, L, D)
+            y = y + u * self.D.unsqueeze(0).unsqueeze(0)      # skip connection
+        return y.to(orig_dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x : (B, C, H, W)"""
@@ -150,7 +180,14 @@ class SelectiveScan2D(nn.Module):
             seq = proj(x2_conv)
             if d == 1:                  # reverse direction
                 seq = seq.flip(1)
-            y = self._ssm_scan(seq)    # (B, L, d_inner)
+            # Checkpoint gio nam BEN TRONG _ssm_scan (theo tung chunk), khong con
+            # checkpoint ca ham o day nua (xem [PATCH v2] trong _ssm_scan).
+            if self.training and seq.requires_grad:
+                # gradient checkpointing: khong luu activation trung gian cua
+                # vong lap 4096 buoc, tinh lai luc backward -> giam manh VRAM
+                y = _grad_checkpoint(self._ssm_scan, seq, use_reentrant=False)
+            else:
+                y = self._ssm_scan(seq)    # (B, L, d_inner)
             if d == 1:
                 y = y.flip(1)
             outs.append(y)
@@ -314,15 +351,16 @@ class MambaUNetGenerator(nn.Module):
         # Bottleneck
         b = self.bottleneck(e2)                  # (B, ngf*4, H/4, W/4)
 
-        # Decoder with skip connections
-        d2 = F.interpolate(b,  scale_factor=2, mode='bilinear', align_corners=False)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))   # (B, ngf*2, H/2, W/2)
+        # Decoder with skip connections -- [PATCH] noi (concat) TRUOC khi kich
+        # thuoc con khop voi tang encoder tuong ung, upsample SAU do cho tang
+        # ke tiep (thay vi upsample truoc roi noi lech kich thuoc nhu ban goc).
+        d2 = self.dec2(torch.cat([b, e2], dim=1))     # (B, ngf*2, H/4, W/4)
 
-        d1 = F.interpolate(d2, scale_factor=2, mode='bilinear', align_corners=False)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))   # (B, ngf,   H,   W)
+        d2 = F.interpolate(d2, scale_factor=2, mode='bilinear', align_corners=False)
+        d1 = self.dec1(torch.cat([d2, e1], dim=1))    # (B, ngf,   H/2, W/2)
 
-        d0 = F.interpolate(d1, scale_factor=2, mode='bilinear', align_corners=False)
-        d0 = self.dec0(torch.cat([d0, e0], dim=1))   # (B, ngf,   H,   W)
+        d1 = F.interpolate(d1, scale_factor=2, mode='bilinear', align_corners=False)
+        d0 = self.dec0(torch.cat([d1, e0], dim=1))    # (B, ngf,   H,   W)
 
         return self.head(d0)                          # (B, out_nc, H, W)
 
